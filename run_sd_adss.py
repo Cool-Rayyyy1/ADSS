@@ -6,8 +6,8 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-from initno.pipelines.pipeline_sd_initno_adss import StableDiffusionInitNOPipeline
-from initno.pipelines.pipeline_sd import StableDiffusionAttendAndExcitePipeline
+from adss.pipelines.pipeline_sd_initno_adss import StableDiffusionInitNOPipeline
+from adss.pipelines.pipeline_sd import StableDiffusionAttendAndExcitePipeline
 from tqdm import tqdm
 import json
 import os
