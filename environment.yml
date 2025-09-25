@@ -5,7 +5,6 @@ channels:
 dependencies:
   - python=3.10.14
   - pip
-  # （上面只放必要的 Conda 依赖；其余通过 pip 安装，见下）
   - ca-certificates
   - openssl
   - sqlite
@@ -27,7 +26,6 @@ dependencies:
   - _openmp_mutex
   - _libgcc_mutex
   - wheel
-  # ---- pip packages from your env ----
   - pip:
       - accelerate==1.10.1
       - aiohappyeyeballs==2.6.1

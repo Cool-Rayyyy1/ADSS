@@ -519,346 +519,28 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
         latents = latents * self.scheduler.init_noise_sigma
         return latents
 
-    def fn_augmented_compute_losss(
-        self, 
-        indices: List[int], 
-        smooth_attentions: bool = True,
-        K: int = 1,
-        attention_res: int = 16,) -> torch.Tensor:
-
-        # -----------------------------
-        # cross-attention response loss
-        # -----------------------------
-        aggregate_cross_attention_maps = self.attention_store.aggregate_attention(
-            from_where=("up", "down", "mid"), is_cross=True)
-        
-        # cross attention map preprocessing
-        cross_attention_maps = aggregate_cross_attention_maps[:, :, 1:-1]
-        cross_attention_maps = cross_attention_maps * 100
-        cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps, dim=-1)
-
-        # Shift indices since we removed the first token
-        indices = [index - 1 for index in indices]
-
-        # clean_cross_attention_loss
-        clean_cross_attn_loss = 0.
-
-        # Extract the maximum values
-        topk_value_list, topk_coord_list_list = [], []
-        for i in indices:
-            cross_attention_map_cur_token = cross_attention_maps[:, :, i]
-            if smooth_attentions: cross_attention_map_cur_token = fn_smoothing_func(cross_attention_map_cur_token)
-            topk_coord_list, _ = fn_get_topk(cross_attention_map_cur_token, K=K)
-
-            topk_value = 0
-            for coord_x, coord_y in topk_coord_list: topk_value = topk_value + cross_attention_map_cur_token[coord_x, coord_y]
-            topk_value = topk_value / K
-
-            topk_value_list.append(topk_value)
-            topk_coord_list_list.append(topk_coord_list)
-
-            # -----------------------------------
-            # clean cross_attention_map_cur_token
-            # -----------------------------------
-            clean_cross_attention_map_cur_token                     = cross_attention_map_cur_token
-            clean_cross_attention_map_cur_token_mask                = fn_get_otsu_mask(clean_cross_attention_map_cur_token)
-            clean_cross_attention_map_cur_token_mask                = fn_clean_mask(clean_cross_attention_map_cur_token_mask, topk_coord_list[0][0], topk_coord_list[0][1])
-            clean_cross_attention_map_cur_token_foreground          = clean_cross_attention_map_cur_token * clean_cross_attention_map_cur_token_mask + (1 - clean_cross_attention_map_cur_token_mask)
-            clean_cross_attention_map_cur_token_background          = clean_cross_attention_map_cur_token * (1 - clean_cross_attention_map_cur_token_mask)
-
-            if clean_cross_attention_map_cur_token_background.max() > clean_cross_attention_map_cur_token_foreground.min():
-                clean_cross_attn_loss = clean_cross_attn_loss + clean_cross_attention_map_cur_token_background.max()
-            else: clean_cross_attn_loss = clean_cross_attn_loss + clean_cross_attention_map_cur_token_background.max() * 0
-
-        cross_attn_loss_list = [max(0 * curr_max, 1.0 - curr_max) for curr_max in topk_value_list]
-        cross_attn_loss = max(cross_attn_loss_list)
-
-        # ------------------------------
-        # cross attention alignment loss
-        # ------------------------------
-        alpha = 0.9
-        if self.cross_attention_maps_cache is None: self.cross_attention_maps_cache = cross_attention_maps.detach().clone()
-        else: self.cross_attention_maps_cache = self.cross_attention_maps_cache * alpha + cross_attention_maps.detach().clone() * (1 - alpha)
-
-        cross_attn_alignment_loss = 0
-        for i in indices:
-            cross_attention_map_cur_token = cross_attention_maps[:, :, i]
-            if smooth_attentions: cross_attention_map_cur_token = fn_smoothing_func(cross_attention_map_cur_token)
-            cross_attention_map_cur_token_cache = self.cross_attention_maps_cache[:, :, i]
-            if smooth_attentions: cross_attention_map_cur_token_cache = fn_smoothing_func(cross_attention_map_cur_token_cache)
-            cross_attn_alignment_loss = cross_attn_alignment_loss + torch.nn.L1Loss()(cross_attention_map_cur_token, cross_attention_map_cur_token_cache)          
-
-        # ----------------------------
-        # self-attention conflict loss
-        # ----------------------------
-        self_attention_maps = self.attention_store.aggregate_attention(
-            from_where=("up", "down", "mid"), is_cross=False)
-
-        self_attention_map_list = []
-        for topk_coord_list in topk_coord_list_list:
-            self_attention_map_cur_token_list = []
-            for coord_x, coord_y in topk_coord_list:
-
-                self_attention_map_cur_token = self_attention_maps[coord_x, coord_y]
-                self_attention_map_cur_token = self_attention_map_cur_token.view(attention_res, attention_res).contiguous()
-                self_attention_map_cur_token_list.append(self_attention_map_cur_token)
-
-            if len(self_attention_map_cur_token_list) > 0:
-                self_attention_map_cur_token = sum(self_attention_map_cur_token_list) / len(self_attention_map_cur_token_list)
-                if smooth_attentions: self_attention_map_cur_token = fn_smoothing_func(self_attention_map_cur_token)
-            else:
-                self_attention_map_per_token = torch.zeros_like(self_attention_maps[0, 0])
-                self_attention_map_per_token = self_attention_map_per_token.view(attention_res, attention_res).contiguous()
-
-            self_attention_map_list.append(self_attention_map_cur_token)
-
-        self_attn_loss, number_self_attn_loss_pair = 0, 0
-        number_token = len(self_attention_map_list)
-        for i in range(number_token):
-            for j in range(i + 1, number_token): 
-                number_self_attn_loss_pair = number_self_attn_loss_pair + 1
-                self_attention_map_1 = self_attention_map_list[i]
-                self_attention_map_2 = self_attention_map_list[j]
-
-                self_attention_map_min = torch.min(self_attention_map_1, self_attention_map_2) 
-                self_attention_map_sum = (self_attention_map_1 + self_attention_map_2)
-                cur_self_attn_loss = (self_attention_map_min.sum() / (self_attention_map_sum.sum() + 1e-6))
-                self_attn_loss = self_attn_loss + cur_self_attn_loss
-
-        if number_self_attn_loss_pair > 0: self_attn_loss = self_attn_loss / number_self_attn_loss_pair
-
-        joint_loss = cross_attn_loss * 1. + clean_cross_attn_loss * 0.1 + cross_attn_alignment_loss * 0.1 + self_attn_loss * 1.
-        return joint_loss, cross_attn_loss, clean_cross_attn_loss, self_attn_loss
-    
-    def fn_calc_kld_loss_func(self, log_var, mu):
-        return torch.mean(-0.5 * torch.mean(1 + log_var - mu ** 2 - log_var.exp()), dim=0)
-    
-
-
-    def get_token_cross_attn_entropy_avg(
-        self,
-        indices: List[int],
-        smooth_attentions: bool = True
-    ) -> torch.Tensor:
-        """
-        返回形状 [len(indices)] 的张量:
-            values[i] = 第 indices[i] 个 token 的 cross-attention entropy
-                        先对每个 head 的 attention 计算 entropy，再对 16 个 head 求平均
-        * indices 用原始 prompt 下标（含 <BOS>/<EOS>）
-        """
-
-        # 1) 聚合 cross attention；形状 [16, 16, 77]
-        attn = self.attention_store.aggregate_attention(
-            from_where=("up", "down", "mid"), is_cross=True
-        )
-
-        # 2) 去掉 <BOS>/<EOS>，做温度缩放 + softmax → [16, 16, 75]
-        attn = torch.softmax(attn[:, :, 1:-1] * 100, dim=-1)
-
-        values = []
-        for raw_idx in indices:
-            idx = raw_idx - 1                  # <BOS> 被裁掉，索引 -1
-            token_map = attn[:, :, idx]        # [H=16, Q=16]
-
-            if smooth_attentions:
-                token_map = fn_smoothing_func(token_map)
-
-            # (a) 计算每个 head 内的 entropy → [H]
-            entropy_per_head = -(token_map * token_map.log()).sum(dim=1)
-
-            # (b) 16 个 head 的 entropy 再做平均 → 标量
-            head_entropy_avg = entropy_per_head.mean()
-
-            values.append(head_entropy_avg)
-
-        return torch.stack(values)             # tensor([entropy_token1, entropy_token2, ...])
-
-
-
-    def get_token_cross_attn_entropy_all(
-        self,
-        indices: List[int],
-        smooth_attentions: bool = True
-    ) -> torch.Tensor:
-        """
-        返回形状 [len(indices)] 的张量:
-            values[i] = 第 indices[i] 个 token 的 cross-attention entropy
-                        将 16 个 head 拼成整体分布再计算 entropy
-        * indices 用原始 prompt 下标（含 <BOS>/<EOS>）
-        """
-
-        # 1) 聚合 cross attention；形状 [16, 16, 77]
-        attn = self.attention_store.aggregate_attention(
-            from_where=("up", "down", "mid"), is_cross=True
-        )
-
-        # 2) 去掉 <BOS>/<EOS>，做温度缩放 + softmax → [16, 16, 75]
-        attn = torch.softmax(attn[:, :, 1:-1] * 100, dim=-1)
-
-        values = []
-        for raw_idx in indices:
-            idx = raw_idx - 1                  # <BOS> 被裁掉，索引 -1
-            token_map = attn[:, :, idx]        # [H=16, Q=16]
-
-            if smooth_attentions:
-                token_map = fn_smoothing_func(token_map)
-
-            # (a) 拼成一个整体分布 → [H * Q] = [256]
-            flat_dist = token_map.flatten()
-
-            # (b) 归一化成概率分布
-            flat_dist = flat_dist / flat_dist.sum()
-
-            # (c) 计算整体 entropy
-            entropy_all = -(flat_dist * (flat_dist + 1e-10).log()).sum()
-
-            values.append(entropy_all)
-
-        return torch.stack(values)             # tensor([entropy_token1, entropy_token2, ...])
-
-    def get_token_cross_attn_headmax_avg(
-        self,
-        indices: List[int],
-        smooth_attentions: bool = True
-    ) -> torch.Tensor:
-        """
-        返回形状 [len(indices)] 的张量:
-            values[i] = 第 indices[i] 个 token 的 cross‑attention
-                        先在每个 head 取峰值，再对 16 个 head 做平均
-        * indices 用原始 prompt 下标（含 <BOS>/<EOS>）
-        """
-
-        # 1) 聚合 cross attention；形状 [16, 16, 77]
-        attn = self.attention_store.aggregate_attention(
-            from_where=("up", "down", "mid"), is_cross=True
-        )
-
-        # 2) 去掉 <BOS>/<EOS>，做温度缩放 + softmax  → [16, 16, 75]
-        attn = torch.softmax(attn[:, :, 1:-1] * 100, dim=-1)
-        print(attn)
-        input()
-        values = []
-        for raw_idx in indices:
-            idx = raw_idx - 1                  # <BOS> 被裁掉，索引 -1
-            token_map = attn[:, :, idx]        # [H=16, Q=16]
-
-            if smooth_attentions:
-                token_map = fn_smoothing_func(token_map)
-            #print(token_map)
-            # (a) 每个 head 内取最大值  → [H]
-            per_head_peak = token_map.amax(dim=1)
-            # print(per_head_peak)
-            # input()
-            # (b) 16 个 head 的峰值再做平均 → 标量
-            head_max_avg = per_head_peak.mean()
-
-            values.append(head_max_avg)
-
-        return torch.stack(values)             # tensor([score_token1, score_token2, ...])
-    def get_token_cross_attn_avg2(
-        self,
-        indices: List[int],
-        k: int = 10,
-        smooth_attentions: bool = True
-    ) -> torch.Tensor:
-    
-        # 1) 聚合 cross‑attention；形状 [16, 16, 77]
-        attn = self.attention_store.aggregate_attention(
-            from_where=("up", "down", "mid"), is_cross=True
-        )
-    
-        # 2) 去掉 <BOS>/<EOS>，温度缩放 + softmax → [16, 16, 75]
-        attn = torch.softmax(attn[:, :, 1:-1] * 100, dim=-1)
-
-        avg_vals = []
-        for raw_idx in indices:
-            idx = raw_idx - 1                # 裁掉 <BOS>
-            token_map = attn[:, :, idx]      # [16, 16]
-
-            if smooth_attentions:
-                token_map = fn_smoothing_func(token_map)
-
-            # Head‑max‑avg
-            head_max_avg = token_map.amax(dim=1).mean()
-
-            # Top‑k 均值
-            topk_mean = token_map.flatten().topk(k).values.mean()
-
-            # 两者平均
-            avg_vals.append(0.5 * (head_max_avg + topk_mean))
-
-        return torch.stack(avg_vals)         # tensor([avg2_token1, avg2_token2, ...])
-
-    def get_token_cross_attn_top10(
-        self,
-        indices: List[int],
-        smooth_attentions: bool = True
-    ) -> torch.Tensor:
-        """
-        返回形状 [len(indices)] 的张量:
-        values[i] = 第 indices[i] 个 token 的 cross-attention
-                    top-10 最大值的平均
-        * indices 用原始 prompt 下标（含 <BOS>/<EOS>）
-        """
-
-        # 1) 聚合 cross attention；形状 [16, 16, 77]
-        attn = self.attention_store.aggregate_attention(
-            from_where=("up", "down", "mid"), is_cross=True
-        )
-
-        # 2) 去掉 <BOS>/<EOS>，做温度缩放 + softmax  → [16, 16, 75]
-        attn = torch.softmax(attn[:, :, 1:-1] * 100, dim=-1)
-
-        values = []
-        for raw_idx in indices:
-            idx = raw_idx - 1                      # 裁掉了 <BOS>
-            token_map = attn[:, :, idx]            # [16, 16]
-
-            if smooth_attentions:
-                token_map = fn_smoothing_func(token_map)
-
-            # 拉平成一维，取最大 10 个，再求均值
-            top10_mean = token_map.flatten().topk(20).values.mean()
-            values.append(top10_mean)
-
-        return torch.stack(values)                 # tensor([v_token1, v_token2, ...])
-
-
     def get_token_cross_attn_mean(self,
                               indices: List[int],
                               smooth_attentions: bool = True) -> torch.Tensor:
-        """
-        返回形状 [len(indices)] 的张量：
-        means[i] = 第 indices[i] 个 token 在当前步的 cross‑attention 全局均值
-        * indices 用原始 prompt 下标（含 <BOS>/<EOS>）
-        """
 
-        # 1) 聚合 cross attention；形状 [16, 16, 77]
         attn = self.attention_store.aggregate_attention(
             from_where=("up", "down", "mid"), is_cross=True)
-        # print(attn)
-        # print(attn.shape)
-        # print("---------------------")
-        # 2) 去掉 <BOS>/<EOS>，做温度缩放 + softmax
-        attn = torch.softmax(attn[:, :, 1:-1] * 100, dim=-1)  # -> [16, 16, 75]
-        # print(attn)
-        # print(attn.shape)
-        # input()
+
+        attn = torch.softmax(attn[:, :, 1:-1] * 100, dim=-1)  
         means = []
-        #print(indices)
         for raw_idx in indices:
-            idx = raw_idx - 1                  # 因为上面裁掉了第 0 个 token
-            token_map = attn[:, :, idx]        # [16, 16]
+            idx = raw_idx - 1                  
+            token_map = attn[:, :, idx]        
 
             if smooth_attentions:
                 token_map = fn_smoothing_func(token_map)
 
-            means.append(token_map.mean())     # 对 16×16 全局平均
+            means.append(token_map.mean())    
 
-        return torch.stack(means)              # tensor([μ_token1, μ_token2, ...])
+        return torch.stack(means)              
 
 
-    def fn_initno(
+    def adss(
         self,
         latents: torch.Tensor,
         indices: List[int],
@@ -885,21 +567,18 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
-        # 仅在目标 step 记录一次
         token_value_records = {idx: [] for idx in indices}
 
         for step_idx, t in enumerate(timesteps):
             print(f"[Step {step_idx:02d}/{len(timesteps)}] Denoising timestep: {t.item()}")
             if step_idx > denoising_step_for_loss:
                 break
-            # ---------- 正常正向预测 ----------
             noise_pred_text = self.unet(
                 optimized_latents,
                 t,
                 encoder_hidden_states=text_embeddings[1].unsqueeze(0),
             ).sample
 
-            # ---------- 只在目标 step 做记录 ----------
             if step_idx == denoising_step_for_loss:
                 mean_vals = self.get_token_cross_attn_mean(indices)
                 mean_dict = {
@@ -909,8 +588,6 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
 
                 for idx, val in zip(indices, mean_vals):
                     token_value_records[idx].append(val.item())
-
-            # ---------- 无条件分支 ----------
             with torch.no_grad():
                 noise_pred_uncond = self.unet(
                     optimized_latents,
@@ -918,23 +595,20 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
                     encoder_hidden_states=text_embeddings[0].unsqueeze(0),
                 ).sample
 
-            # ---------- classifier-free guidance ----------
             if do_classifier_free_guidance:
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
 
-            # ---------- 调度器更新 ----------
+
             optimized_latents = self.scheduler.step(
                 noise_pred, t, optimized_latents, **extra_step_kwargs
             ).prev_sample
             optimized_latents = optimized_latents.detach()
 
-            # ---------- 清理 ----------
             self.attention_store.reset()
             del noise_pred_text, noise_pred_uncond, noise_pred
             torch.cuda.empty_cache()
 
-        # ---- 统计均值（每个 token 只会有一条记录）----
         final_means = {
             idx: float(f"{(sum(values) / len(values)):.6f}") if values else 0.0
             for idx, values in token_value_records.items()
@@ -1180,7 +854,7 @@ class StableDiffusionInitNOPipeline(DiffusionPipeline, TextualInversionLoaderMix
             with torch.enable_grad():
                 #optimized_latents_pool = []
                 for round in range(max_round):
-                    over_means = self.fn_initno(
+                    over_means = self.adss(
                         latents=latents,
                         indices=token_indices[0],
                         text_embeddings=prompt_embeds,
